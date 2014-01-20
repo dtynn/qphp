@@ -133,7 +133,7 @@ class QiniuBase {
             CURLOPT_URL => $url
         );
         if (!empty($header)) {
-            $httpHeader = array();
+            $httpHeader = array("User-Agent: " . self::UserAgent);
             foreach ($header as $key => $parsedValue) {
                 $httpHeader[] = "$key: $parsedValue";
             }
