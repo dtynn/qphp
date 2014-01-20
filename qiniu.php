@@ -111,13 +111,17 @@ class QiniuBase {
         return $this->signWithKey($encoded) . ':' . $encoded;
     }
 
-    public function apiCall($url, $body, $contentType = 'application/x-www-form-urlencoded') {
+    public function apiCall($url, $body, $contentType = 'application/x-www-form-urlencoded', $header=null) {
         if ($contentType === 'application/x-www-form-urlencoded') {
             if (is_array($body)) {
                 $body = http_build_query($body);
             }
         }
-        $header = array('Content-Type'=> $contentType);
+        if (empty($header)) {
+            $header = array('Content-Type'=> $contentType);
+        } else {
+            $header['Content-Type'] = $contentType;
+        }
         return $this->clientDo($url, $header, $body);
     }
 
@@ -132,13 +136,13 @@ class QiniuBase {
             CURLOPT_NOBODY => false,
             CURLOPT_URL => $url
         );
+        $httpHeader = array("User-Agent: " . self::UserAgent);
         if (!empty($header)) {
-            $httpHeader = array("User-Agent: " . self::UserAgent);
             foreach ($header as $key => $parsedValue) {
                 $httpHeader[] = "$key: $parsedValue";
             }
-            $options[CURLOPT_HTTPHEADER] = $httpHeader;
         }
+        $options[CURLOPT_HTTPHEADER] = $httpHeader;
         if (!empty($body)) {
             $options[CURLOPT_POSTFIELDS] = $body;
         }
@@ -234,10 +238,10 @@ class QiniuBase {
 
 
 class QiniuBucketController extends QiniuBase {
-    private $_bucket;
-    private $_putPolicy;
-    private $_putExtra;
-    private $_getPolicy;
+    public  $_bucket;
+    public  $_putPolicy;
+    public  $_putExtra;
+    public  $_getPolicy;
 
     public function __construct($accessKey, $secretKey, $bucket) {
         $this->_bucket = $bucket;
@@ -305,7 +309,10 @@ class QiniuBucketController extends QiniuBase {
         $b = json_encode($policyArray);
         return $this->signWithData($b);
     }
+}
 
+
+class QiniuBucketSimpleUploader extends QiniuBucketController {
     public  function _put($upToken, $key, $data, $putExtra=null, $filename=null) {
         if ($upToken === null) {
             $upToken = $this->makeUploadToken();
@@ -336,4 +343,9 @@ class QiniuBucketController extends QiniuBase {
         $filename = basename($localFile);
         return $this->put($key, $data, $filename);
     }
+}
+
+
+class QiniuBucketResumableUploader extends QiniuBucketController {
+
 }
