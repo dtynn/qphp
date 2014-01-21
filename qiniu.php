@@ -11,6 +11,11 @@ define('UP_HOST' , 'http://up.qiniu.com');
 define('RS_HOST', 'http://rs.qbox.me');
 define('RSF_HOST', 'http://rsf.qbox.me');
 
+define('QINIU_RIO_BLOCK_BITS', 22);
+define('QINIU_RIO_BLOCK_SIZE', 1 << QINIU_RIO_BLOCK_BITS);
+define('QINIU_RIO_CHUNK_BITS', 18);
+define('QINIU_RIO_CHUNK_SIZE', 1 << QINIU_RIO_CHUNK_BITS);
+
 
 class QiniuError {
     public $Err;
@@ -122,6 +127,7 @@ class QiniuBase {
         } else {
             $header['Content-Type'] = $contentType;
         }
+        $header['Content-Length'] = strlen($body);
         return $this->clientDo($url, $header, $body);
     }
 
@@ -237,11 +243,11 @@ class QiniuBase {
 }
 
 
-class QiniuBucketController extends QiniuBase {
-    public  $_bucket;
-    public  $_putPolicy;
-    public  $_putExtra;
-    public  $_getPolicy;
+class QiniuBucketBase extends QiniuBase {
+    public $_bucket;
+    private $_putPolicy;
+    private $_putExtra;
+    private $_getPolicy;
 
     public function __construct($accessKey, $secretKey, $bucket) {
         $this->_bucket = $bucket;
@@ -252,8 +258,22 @@ class QiniuBucketController extends QiniuBase {
         $this->_putPolicy = $putPolicy;
     }
 
+    public function getPutPolicy() {
+        if (empty($this->_putPolicy)) {
+            $this->_putPolicy = new QiniuPutPolicy($this->_bucket);
+        }
+        return $this->_putPolicy;
+    }
+
     public function setPutExtra($putExtra) {
         $this->_putExtra = $putExtra;
+    }
+
+    public function getPutExtra() {
+        if (empty($this->_putExtra)) {
+            $this->_putExtra = new QiniuPutExtra();
+        }
+        return $this->_putExtra;
     }
 
     public function setGetPolicy($getPolicy) {
@@ -261,10 +281,7 @@ class QiniuBucketController extends QiniuBase {
     }
 
     public function makeUploadToken() {
-        if (empty($this->_putPolicy)) {
-            $this->_putPolicy = new QiniuPutPolicy($this->_bucket);
-        }
-        $policy = $this->_putPolicy;
+        $policy = $this->getPutPolicy();
         $deadline = time() + $policy->expires;
 
         $policyArray = array('scope' => $policy->scope, 'deadline' => $deadline);
@@ -312,8 +329,8 @@ class QiniuBucketController extends QiniuBase {
 }
 
 
-class QiniuBucketSimpleUploader extends QiniuBucketController {
-    public  function _put($upToken, $key, $data, $putExtra=null, $filename=null) {
+class QiniuBucketSimpleUploader extends QiniuBucketBase {
+    private  function _put($upToken, $key, $data, $putExtra=null, $filename=null) {
         if ($upToken === null) {
             $upToken = $this->makeUploadToken();
         }
@@ -329,23 +346,119 @@ class QiniuBucketSimpleUploader extends QiniuBucketController {
         if ($putExtra->checkCrc) {
             $fields['crc32'] = $putExtra->crc32;
         }
+        if(!empty($putExtra->params) and is_array($putExtra->params)) {
+            foreach($putExtra->params as $name => $val) {
+                $fields[$name] = $val;
+            }
+        }
         $file = array($filename, $data, $putExtra->mimeType);
         list($contentType, $body) = $this->makeMultipartForm($fields, $file);
         return $this->apiCall(self::UpHost, $body, $contentType);
     }
 
-    public function put($key, $data, $filename=null) {
-        return $this->_put($this->makeUploadToken(), $key, $data, $this->_putExtra, $filename);
+    public function put($key, $data, $putExtra=null, $filename=null) {
+        return $this->_put($this->makeUploadToken(), $key, $data, $putExtra, $filename);
     }
 
-    public function putFile($key, $localFile) {
+    public function putFile($key, $localFile, $putExtra=null) {
         $data = file_get_contents($localFile);
         $filename = basename($localFile);
-        return $this->put($key, $data, $filename);
+        return $this->put($key, $data, $putExtra, $filename);
     }
 }
 
 
-class QiniuBucketResumableUploader extends QiniuBucketController {
+class QiniuFileReader {
+    private $_data;
+    private $_start = 0;
+    private $_size = 0;
 
+    public function __construct($data) {
+        $this->_data = $data;
+        $this->_size = strlen($data);
+
+    }
+
+    public function Read($size) {
+        $content = substr($this->_data, $this->_start, $size);
+        $this->_start = $this->_start + $size;
+        return $content;
+    }
+
+    public function Seek($start) {
+        $this->_start = $start;
+        return true;
+    }
+
+    public function Size() {
+        return $this->_size;
+    }
+}
+
+
+class QiniuRioPutExtra
+{
+    public $params = null;
+    public $mimeType = null;
+    public $chunkSize = QINIU_RIO_CHUNK_SIZE;
+    public $tryTimes = 0;
+    public $progress = null;
+    public $blkProgresses = null;
+    public $notify = null;		// 进度通知：func(blkIdx int, blkSize int, ret *BlkputRet)
+    public $notifyErr = null;	// 错误通知：func(blkIdx int, blkSize int, err error)
+}
+
+
+class QiniuBucketResumableUploader extends QiniuBucketBase {
+    const BlockBits = QINIU_RIO_BLOCK_BITS;
+    const BlockSize = QINIU_RIO_BLOCK_SIZE;
+    const ChunkBits = QINIU_RIO_CHUNK_BITS;
+    const ChunkSize = QINIU_RIO_CHUNK_SIZE;
+
+    private $_rioPutExtra;
+
+    public function blockCount($fileSize) {
+        return ($fileSize + (self::BlockSize - 1)) >> self::BlockBits;
+    }
+
+    public function chunkCount($blockSize) {
+        return ($blockSize + (self::ChunkSize -1)) >> self::ChunkBits;
+    }
+
+    public function setRioPutExtra($rioPutExtra) {
+        $this->_rioPutExtra = $rioPutExtra;
+    }
+
+    public function getRioPutExtra() {
+        if (empty($this->_rioPutExtra)) {
+            $this->_rioPutExtra = new QiniuRioPutExtra();
+        }
+        return $this->_rioPutExtra;
+    }
+
+    private function makeRioRequestHeader() {
+        $upToken = $this->makeUploadToken();
+        $header = array('Authorization' => "UpToken $upToken");
+        return $header;
+    }
+
+    private function mkblk($host, $size, $body) {
+        $mkblkUrl = $host . "/mkblk/$size";
+        $mkblkHeader = $this->makeRioRequestHeader();
+        return $this->apiCall($mkblkUrl, $body, 'application/octet-stream', $mkblkHeader);
+    }
+
+    private function bput($host, $ctx, $offset, $body) {
+        $bputUrl = $host . "/bput/$ctx/$offset";
+        $bputHeader = $this->makeRioRequestHeader();
+        return $this->apiCall($bputUrl, $body, 'application/octet-stream', $bputHeader);
+    }
+
+    private function mkfile() {
+
+    }
+
+    private function blockUpload() {
+
+    }
 }
