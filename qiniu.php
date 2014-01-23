@@ -11,10 +11,10 @@ define('UP_HOST' , 'http://up.qiniu.com');
 define('RS_HOST', 'http://rs.qbox.me');
 define('RSF_HOST', 'http://rsf.qbox.me');
 
-define('QINIU_RIO_BLOCK_BITS', 22);
-define('QINIU_RIO_BLOCK_SIZE', 1 << QINIU_RIO_BLOCK_BITS);
-define('QINIU_RIO_CHUNK_BITS', 18);
-define('QINIU_RIO_CHUNK_SIZE', 1 << QINIU_RIO_CHUNK_BITS);
+define('QINIU_BLOCK_BITS', 22);
+define('QINIU_BLOCK_SIZE', 1 << QINIU_BLOCK_BITS);
+define('QINIU_CHUNK_BITS', 18);
+define('QINIU_CHUNK_SIZE', 1 << QINIU_CHUNK_BITS);
 
 
 class QiniuError {
@@ -74,9 +74,17 @@ class QiniuPutPolicy {
     public $persistentOps;
     public $persistentNotifyUrl;
 
-    public function __construct($scope) {
+    public function __construct($scope, $expires=null) {
         $this->scope = $scope;
-        $this->expires = 3600;
+        $this->expires = empty($expires) ? 3600 : $expires ;
+    }
+}
+
+class QiniuGetPolicy {
+    public $expires;                //默认为3600s
+
+    public function __construct($expires=null) {
+        $this->expires = empty($expires) ? 3600 : $expires ;
     }
 }
 
@@ -246,7 +254,6 @@ class QiniuBase {
 class QiniuBucketBase extends QiniuBase {
     public $_bucket;
     private $_putPolicy;
-    private $_putExtra;
     private $_getPolicy;
 
     public function __construct($accessKey, $secretKey, $bucket) {
@@ -265,19 +272,15 @@ class QiniuBucketBase extends QiniuBase {
         return $this->_putPolicy;
     }
 
-    public function setPutExtra($putExtra) {
-        $this->_putExtra = $putExtra;
-    }
-
-    public function getPutExtra() {
-        if (empty($this->_putExtra)) {
-            $this->_putExtra = new QiniuPutExtra();
-        }
-        return $this->_putExtra;
-    }
-
     public function setGetPolicy($getPolicy) {
         $this->_getPolicy = $getPolicy;
+    }
+
+    public function getGetPolicy() {
+        if (empty($this->_getPolicy)) {
+            $this->_getPolicy = new QiniuGetPolicy();
+        }
+        return $this->_getPolicy;
     }
 
     public function makeUploadToken() {
@@ -326,6 +329,20 @@ class QiniuBucketBase extends QiniuBase {
         $b = json_encode($policyArray);
         return $this->signWithData($b);
     }
+
+    public function makePrivateUrl($baseUrl) {
+        $policy = $this->getGetPolicy();
+        $deadline = time() + $policy->expires;
+        $pos = strpos($baseUrl, '?');
+        if ($pos !== false) {
+            $baseUrl .= '&e=';
+        } else {
+            $baseUrl .= '?e=';
+        }
+        $baseUrl .= $deadline;
+        $token = $this->signWithKey($baseUrl);
+        return "$baseUrl&token=$token";
+    }
 }
 
 
@@ -368,7 +385,7 @@ class QiniuBucketSimpleUploader extends QiniuBucketBase {
 }
 
 
-class QiniuFileReader {
+class QiniuFileObject {
     private $_data;
     private $_start = 0;
     private $_size = 0;
@@ -400,40 +417,24 @@ class QiniuRioPutExtra
 {
     public $params = null;
     public $mimeType = null;
-    public $chunkSize = QINIU_RIO_CHUNK_SIZE;
-    public $tryTimes = 0;
+    public $chunkBits = QINIU_CHUNK_BITS;
+    public $tryTimes = 3;
     public $progress = null;
-    public $blkProgresses = null;
     public $notify = null;		// 进度通知：func(blkIdx int, blkSize int, ret *BlkputRet)
     public $notifyErr = null;	// 错误通知：func(blkIdx int, blkSize int, err error)
+
+    public function __construct() {
+        $this->chunkSize = 1 << $this->chunkBits;
+    }
 }
 
 
 class QiniuBucketResumableUploader extends QiniuBucketBase {
-    const BlockBits = QINIU_RIO_BLOCK_BITS;
-    const BlockSize = QINIU_RIO_BLOCK_SIZE;
-    const ChunkBits = QINIU_RIO_CHUNK_BITS;
-    const ChunkSize = QINIU_RIO_CHUNK_SIZE;
-
-    private $_rioPutExtra;
+    const BlockBits = QINIU_BLOCK_BITS;
+    const BlockSize = QINIU_BLOCK_SIZE;
 
     public function blockCount($fileSize) {
         return ($fileSize + (self::BlockSize - 1)) >> self::BlockBits;
-    }
-
-    public function chunkCount($blockSize) {
-        return ($blockSize + (self::ChunkSize -1)) >> self::ChunkBits;
-    }
-
-    public function setRioPutExtra($rioPutExtra) {
-        $this->_rioPutExtra = $rioPutExtra;
-    }
-
-    public function getRioPutExtra() {
-        if (empty($this->_rioPutExtra)) {
-            $this->_rioPutExtra = new QiniuRioPutExtra();
-        }
-        return $this->_rioPutExtra;
     }
 
     private function makeRioRequestHeader() {
@@ -442,23 +443,87 @@ class QiniuBucketResumableUploader extends QiniuBucketBase {
         return $header;
     }
 
-    private function mkblk($host, $size, $body) {
+    private function mkblk($host, $size, $firstChunk) {
         $mkblkUrl = $host . "/mkblk/$size";
         $mkblkHeader = $this->makeRioRequestHeader();
-        return $this->apiCall($mkblkUrl, $body, 'application/octet-stream', $mkblkHeader);
+        return $this->apiCall($mkblkUrl, $firstChunk, 'application/octet-stream', $mkblkHeader);
     }
 
-    private function bput($host, $ctx, $offset, $body) {
+    private function bput($host, $ctx, $offset, $chunk) {
         $bputUrl = $host . "/bput/$ctx/$offset";
         $bputHeader = $this->makeRioRequestHeader();
-        return $this->apiCall($bputUrl, $body, 'application/octet-stream', $bputHeader);
+        return $this->apiCall($bputUrl, $chunk, 'application/octet-stream', $bputHeader);
     }
 
-    private function mkfile() {
-
+    private function mkfile($host, $key, $fsize, $rioPutExtra) {
+        $mkfileUrl = $host . "/mkfile/$fsize";
+        if ($key !== null) {
+            $mkfileUrl .= "/key/" . $this->urlsafeEncode($key);
+        }
+        if (!empty($rioPutExtra->mimeType)) {
+            $mkfileUrl .= "/mimeType/" . $this->urlsafeEncode($rioPutExtra->mimeType);
+        }
+        if (!empty($rioPutExtra->params)) {
+            foreach ($rioPutExtra->params as $k => $v) {
+                $mkfileUrl .= "/" . $k . "/" . $this->urlsafeEncode($v);
+            }
+        }
+        $ctxs = array();
+        foreach ($rioPutExtra->progress as $prog) {
+            $ctxs [] = $prog['ctx'];
+        }
+        $body = implode(',', $ctxs);
+        $header = $this->makeRioRequestHeader();
+        var_dump($mkfileUrl);
+        return $this->apiCall($mkfileUrl, $body, 'application/octet-stream', $header);
     }
 
-    private function blockUpload() {
+    private function blockUpload($block, $rioPutExtra) {
+        $blockReader = new QiniuFileObject($block);
+        $blockSize = $blockReader->Size();
+        $firstChunk = $blockReader->Read($rioPutExtra->chunkSize);
+        list($lastChunkRet, $mkblkErr) = $this->mkblk(self::UpHost, $blockSize, $firstChunk);
+        if ($mkblkErr !== null) {
+            return array(null, $mkblkErr);
+        }
+        while ($lastChunkRet['offset'] < $blockSize) {
+            $ctx = $lastChunkRet['ctx'];
+            $offset = $lastChunkRet['offset'];
+            $host = $lastChunkRet['host'];
+            list($lastChunkRet, $bputErr) = $this->bput($host, $ctx, $offset, $blockReader->Read($rioPutExtra->chunkSize));
+            if ($bputErr !== null) {
+                return array(null, $bputErr);
+            }
+        }
+        return array($lastChunkRet, null);
+    }
 
+    public function resumablePut($key, $data, $rioPutExtra=null) {
+        if ($rioPutExtra === null) {
+            $rioPutExtra = new QiniuRioPutExtra();
+        }
+        $dataReader = new QiniuFileObject($data);
+        $blockCount = $this->blockCount($dataReader->Size());
+        $rioPutExtra->progress = array();
+        for ($ct=0; $ct<$blockCount; $ct++) {
+            $block = $dataReader->Read(self::BlockSize);
+            list($ret, $err) = $this->blockUpload($block, $rioPutExtra);
+            if ($err !== null) {
+                $tried = 1;
+                while ($tried < $rioPutExtra->tryTimes) {
+                    list($ret, $err) = $this->blockUpload($block, $rioPutExtra);
+                    if ($err === null) {
+                        break;
+                    } else {
+                        $tried ++;
+                    }
+                }
+            }
+            if ($err !== null) {
+                return array(null, $err);
+            }
+            $rioPutExtra->progress [] = $ret;
+        }
+        return $this->mkfile(self::UpHost, $key, $dataReader->Size(), $rioPutExtra);
     }
 }
